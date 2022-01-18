@@ -1,0 +1,118 @@
+---
+title: "BDA Final Project"
+author: "Adas Bankauskas"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(rstanarm)
+library(brms)
+library(bayesplot)
+library(bayestestR)
+library(tidybayes)
+library(parameters)
+library(patchwork)
+library(magrittr)
+library(lubridate)
+library(broom)
+library(broom.mixed)
+library(ggbeeswarm)
+library(loo)
+library(emmeans)
+
+options(mc.cores = parallel::detectCores())
+set.seed(1766)
+```
+NBA Dataset from Kaggle user Nicklaus Kim.
+https://www.kaggle.com/nicklauskim/nba-per-game-stats-201920?select=nba_2020_per_game.csv It contains basic NBA statistics like points per game (ppg), rebounds per game (rpg) and more advanced statistics like Player Efficiency Rating (PER) and True Shooting Percentage (TS%).
+```{r import csv file}
+nba <- read_csv("nba_2020_per_game.csv")
+
+#making a binary variable for a high amount of turnovers
+nba <- nba %>% mutate(high = (TOV > 3))
+
+nba%>% glimpse()
+```
+I will analyze the regression of Player Efficiency Rating (PER) against points and its interaction with the previously made 'high' variable, minutes played, rebounds, assists, (per game for all). PER takes into account most of the offensive statistics but is weak in measuring defensive performance. I could have chosen to edit the normal prior and add a mean differing from 0, but chose not to because it did not make much of a difference when I tested it out.
+
+```{r rstan analysis}
+nba_stan <- stan_glm(PER ~ PTS * high + MP + TRB + AST, data = nba)
+```
+
+Now I will use trace plots and a posterior predictive check to see how the MCMC process turned out
+```{r trace plots}
+plot(nba_stan, plotfun = "trace")
+
+pp_check(nba_stan)
+```
+The plots look good as the chains are stationary, meaning they travel in a zigzag pattern horizontal and do not go up or down.
+
+The posterior predictive check is not as good as I would like; however, it is close enough to model the data.
+
+I want to see how much effect the prior has on the posterior.
+```{r}
+posterior_vs_prior(nba_stan)
+```
+As seen above, the prior has no notable effect on the posterior because the width of the posterior is minuscule.
+```{r}
+summary(nba_stan, digits = 2)
+```
+Rhat is good because it is 1.00 for all predictor variables and below the recommended number of 1.01 by Professor Buyske. ESS for all the predictor variables is above 400 so that works as well. The ESS being in the thousands makes it that more effective than just in the hundreds.
+
+Predicting LeBron James's Player Efficiency Rating (PER) using the model of 
+```{r prediction at a particular set of values}
+# p = points per game, r = rebounds per game, a = assists per game, mp = minutes played
+p = 25.2
+r = 7.8
+a = 10.2
+mp = 34.6
+TOV_less_than_3 = 9.6+.92*p-.54*mp+1.27*r+.76*a
+#6.41+.38*25.3+.80*7.8+.16*10.2
+TOV_more_than_3 = 9.6+.68*p-.54*mp+1.27*r+.76*a+.47
+#6.41+(.38+.22)*25.3+.80*7.8+.16*10.2-5.01
+TOV_less_than_3
+TOV_more_than_3
+```
+For the NBA year of 2019-20, James's PER was 25.5. If I use the model where turnovers are less than or equal to 3, his PER explodes to 31.758. However, since he averaged 3.9 turnovers this season, I have to use the other model that takes into account the high number of turnovers, and his PER is brought down to 26.18, which is extremely close to his actual PER of 25.5. Another example where this model works well is for Kevin Huerter, a role player who averaged below 3 turnovers during that season. His predicted PER is 11.963 and his actual PER was 11.5. Where this model tends to diverge from the actual PER is around the 3 turnover mark because that is where I separated the 'high' variable into (>3). For example, Jrue Holiday, a starter for the Pelicans at the time, had a PER of 17 and the model predicted 19.6. This is due to me setting the arbitrary boundary for the variable at 3 and would be present for any player where I chose to check on the boundary of the variable.
+```{r}
+describe_posterior(nba_stan)
+```
+This table above shows more summary statistics like credible intervals and ROPE that were not seen in the summary() function. An interesting thing to note is how the 'MP' variable is negative, dismissing the notion of the always having positive correlation between playing time and efficiency. The best players are going to have the most playing time, but that does not mean they are always efficient. There have been all-time greats that have won MVPs that have produced low PER numbers with a high numbers of minutes played.
+```{r}
+nba_stan %>% as.data.frame() %$% mean(AST > .92)
+```
+The probability that the regression coefficient for AST is greater than 0.92 is  0.1645. I chose 'greater than .92' because I wanted to see the chance that assists per game would have a greater impact than points per game on the model. That chance is slim, going to show that points per game will likely matter more for the calculation of PER for any given player.
+
+
+In the following code chunks, I make hierarchical models that differ slightly. In the first model, the interaction is kept and the intercept is varied by team. In the second model, the interaction is not kept and intercept is varied by team. In the third model, the interaction is not kept and the slope and intercept are both varied by team. I wanted to see to see which of these models best encapsulates the effect of the PERs of the players on a specific team.
+
+```{r}
+nba_hier1 <- stan_glmer(PER ~ PTS * high + MP + TRB + AST + (1 | Tm), data = nba)
+pp_check(nba_hier1)
+```
+```{r}
+nba_hier2 <- stan_glmer(PER ~ PTS + MP + TRB + AST + (1 | Tm), data = nba)
+pp_check(nba_hier2)
+```
+```{r}
+nba_hier3 <- stan_glmer(PER ~ PTS + MP + TRB + AST + (PTS | Tm), data = nba)
+pp_check(nba_hier3)
+```
+
+Now let's see which model is the best. k_threshold = 0.7 argument is added to handle points with leave one out cross validation. The larger k is, the bigger the gap between a model including that point and the model excluding that point.
+```{r}
+hier1 <- loo(nba_hier1, k_threshold = 0.7)
+hier2 <- loo(nba_hier2, k_threshold = 0.7)
+hier3 <- loo(nba_hier3, k_threshold = 0.7)
+loo_compare(hier1, hier2, hier3)
+```
+nba_hier1 is the better model compared to the other two models. nba_hier2 and 3 have 3.3 and 3.5 standard errors, so those models would not be accurate representations as the accepted amount of standards errors should be below 2.5.
+Intuitively, it makes sense why the first model was the best. That is because a high amount of turnovers usually implies that the player has lower efficiency than average, but there are clear exceptions (like LeBron James). 
+
+### Honor Pledge
+On my honor, I have neither received nor given any unauthorized assistance on this project.
+
+Adas Bankauskas
